@@ -53,8 +53,10 @@ class App(tk.Tk):
         self._views: dict[str, dict] = {}
         self._drag: tuple[str, int, int] | None = None
         self._wheel_target: str | None = None
+        self._space_down = False
 
         self._build()
+        self._bind_space()
         self._refresh_buttons()
         self.after(50, self._poll_events)
 
@@ -499,8 +501,7 @@ class App(tk.Tk):
         delta_x = event.x_root - origin_x
         delta_y = event.y_root - origin_y
         self._drag = (key, event.x_root, event.y_root)
-        one_side = bool(event.state & 0x4)
-        names = [key] if one_side else list(self._views)
+        names = [key] if self._space_down else list(self._views)
         for name in names:
             pan = self._views[name]["pan"]
             pan[0] += delta_x
@@ -511,6 +512,28 @@ class App(tk.Tk):
         self._drag = None
         self.unbind_all("<B1-Motion>")
         self.unbind_all("<ButtonRelease-1>")
+
+    def _bind_space(self) -> None:
+        """Space pans one preview. It must not activate the focused button."""
+        for widget_class in ("Button", "TButton"):
+            self.bind_class(widget_class, "<KeyPress-space>", self._on_space_press)
+            self.bind_class(widget_class, "<KeyRelease-space>", self._on_space_release)
+        self.bind_all("<KeyPress-space>", self._on_space_press)
+        self.bind_all("<KeyRelease-space>", self._on_space_release)
+        self.bind("<FocusOut>", self._on_space_release)
+
+    def _on_space_press(self, event) -> str | None:
+        self._space_down = True
+        if event.widget.winfo_class() in {"Button", "TButton"}:
+            return "break"
+        return None
+
+    def _on_space_release(self, event=None) -> str | None:
+        self._space_down = False
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget.winfo_class() in {"Button", "TButton"}:
+            return "break"
+        return None
 
     def _redraw_view(self, key: str) -> None:
         view = self._views.get(key)
