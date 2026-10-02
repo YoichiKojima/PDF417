@@ -181,6 +181,7 @@ class App(tk.Tk):
         canvas.bind("<Enter>", lambda _event, name=key: self._arm_wheel(name))
         canvas.bind("<Leave>", lambda _event: self._disarm_wheel())
         canvas.bind("<ButtonPress-1>", lambda event, name=key: self._on_pan_start(event, name))
+        canvas.bind("<Double-Button-1>", lambda _event, name=key: self._on_double_click(name))
         return frame
 
     def _build_zoom_controls(self, parent: ttk.Frame) -> None:
@@ -480,6 +481,25 @@ class App(tk.Tk):
                 (cursor_y - height / 2) * (1 - applied) + pan_y * applied,
             ]
             self._redraw_view(name)
+
+    def _is_original_view(self) -> bool:
+        if abs(self._zoom - 1.0) > 0.001:
+            return False
+        return all(
+            abs(view["pan"][0]) < 0.5 and abs(view["pan"][1]) < 0.5
+            for view in self._views.values()
+        )
+
+    def _on_double_click(self, key: str) -> None:
+        if self._views[key]["image"] is None:
+            return
+        self._on_pan_end()
+        if self._is_original_view():
+            self._zoom = 2.0
+            for name in self._views:
+                self._redraw_view(name)
+            return
+        self._view_original()
 
     def _on_pan_start(self, event, key: str) -> None:
         if key == "source" and self._views[key]["image"] is None:
