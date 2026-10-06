@@ -20,6 +20,22 @@ class GenerateOptions:
     eci: str | None = "UTF-8"
 
 
+PDF417_MAX_CODEWORDS = 928
+
+
+def legal_symbol_size(
+    columns: int | None,
+    rows: int | None,
+) -> tuple[int | None, int | None]:
+    """Keep a requested PDF417 size inside the 928 codeword limit."""
+    if not columns or not rows or columns * rows <= PDF417_MAX_CODEWORDS:
+        return columns, rows
+    fitted_rows = PDF417_MAX_CODEWORDS // columns
+    if fitted_rows < 3:
+        return columns, None
+    return columns, fitted_rows
+
+
 def generate_image(content: str | bytes, options: GenerateOptions | None = None) -> Image.Image:
     """Encode content as PDF417 and return a grayscale Pillow image."""
     opts = options or GenerateOptions()

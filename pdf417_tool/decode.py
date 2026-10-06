@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -175,9 +176,19 @@ def _scale_position(position: dict[str, dict[str, int]], factor: float) -> dict[
 
 
 def _extra(barcode) -> dict | None:
-    extra = barcode.extra
+    # The packaged app used to abort the whole scan here. Optional metadata is
+    # parsed with the standard json module, which a one-file build can omit.
+    try:
+        extra = barcode.extra
+    except Exception:
+        return None
     if not extra:
         return None
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except json.JSONDecodeError:
+            return {"value": extra}
     if isinstance(extra, dict):
         return extra
     return {"value": str(extra)}

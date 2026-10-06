@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import re
 import threading
@@ -9,10 +10,12 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from .decode import Pdf417Symbol, decode_image, decode_path
-from .encode import GenerateOptions, generate_fitted, with_transparent_background
+from PIL import Image, ImageEnhance, ImageGrab, ImageTk
+
+from .decode import Pdf417Symbol, decode_image
+from .encode import GenerateOptions, generate_fitted, legal_symbol_size, with_transparent_background
 
 PREVIEW_WIDTH = 460
 PREVIEW_HEIGHT = 250
@@ -25,9 +28,10 @@ SAVE_TYPES = [
     ("JPEG image", "*.jpg"),
     ("BMP image", "*.bmp"),
 ]
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 
 
-class App(tk.Tk):
+class App(TkinterDnD.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PDF417 Barcode")
@@ -40,10 +44,11 @@ class App(tk.Tk):
         self.original_text = ""
         self.original_bytes: bytes | None = None
         self.original_is_binary = False
-        self.layout_rows: int | None = None
-        self.layout_columns: int | None = None
-        self.layout_security: int | None = None
         self.generated_dirty = False
+        self._ignore_layout = False
+        self.columns_var = tk.StringVar()
+        self.rows_var = tk.StringVar()
+        self.security_var = tk.StringVar()
         self._busy = False
         self._ignore_modified = False
         self._events: queue.Queue = queue.Queue()
@@ -57,6 +62,7 @@ class App(tk.Tk):
 
         self._build()
         self._bind_space()
+        self._enable_file_drop()
         self._refresh_buttons()
         self.after(50, self._poll_events)
 
@@ -91,12 +97,20 @@ class App(tk.Tk):
             command=self._choose_file,
         )
         self.upload_button.pack(side="right")
+        self.screenshot_button = ttk.Button(
+            header,
+            text="Screenshot",
+            style="Upload.TButton",
+            command=self._take_screenshot,
+        )
+        self.screenshot_button.pack(side="right", padx=(0, 8))
 
         ttk.Label(
             root,
             text=(
-                "Choose a barcode image. Scroll to zoom both pictures together. "
-                "Drag to move both pictures. Hold Ctrl and drag to move one picture."
+                "Choose a barcode image, drop one from Explorer, or take a screenshot. "
+                "Scroll to zoom both pictures together. "
+                "Drag to move both pictures. Hold Space and drag to move one picture."
             ),
             style="Hint.TLabel",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 12))
@@ -122,14 +136,19 @@ class App(tk.Tk):
         self._bar = self.progress.create_rectangle(0, 0, 0, 14, fill="#1d4e89", width=0)
         self.progress.grid(row=0, column=0, sticky="ew")
         self.progress.bind("<Configure>", self._redraw_progress)
+        self.result = ttk.Label(progress_row, text="", font=("Segoe UI", 11, "bold"))
+        self.result.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.status = ttk.Label(progress_row, text="Waiting for a barcode image.", style="Hint.TLabel")
-        self.status.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.details = ttk.Label(
-            progress_row,
-            text="Rows, columns, and error correction appear after a barcode is read.",
-            font=("Segoe UI", 11, "bold"),
-        )
-        self.details.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.status.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        layout = ttk.Frame(progress_row)
+        layout.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self._layout_spins = [
+            self._layout_spin(layout, "Columns", self.columns_var, 1, 30),
+            self._layout_spin(layout, "Rows", self.rows_var, 3, 90),
+            self._layout_spin(layout, "Error correction", self.security_var, 0, 8),
+        ]
+        for variable in (self.columns_var, self.rows_var, self.security_var):
+            variable.trace_add("write", self._on_layout_changed)
 
         content_frame = ttk.LabelFrame(root, text="Content", padding=8)
         content_frame.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(4, 12))
@@ -184,6 +203,26 @@ class App(tk.Tk):
         canvas.bind("<Double-Button-1>", lambda _event, name=key: self._on_double_click(name))
         return frame
 
+    def _layout_spin(
+        self,
+        parent: ttk.Frame,
+        label: str,
+        variable: tk.StringVar,
+        low: int,
+        high: int,
+    ) -> ttk.Spinbox:
+        ttk.Label(parent, text=label).pack(side="left")
+        spin = ttk.Spinbox(
+            parent,
+            from_=low,
+            to=high,
+            textvariable=variable,
+            width=5,
+            justify="center",
+        )
+        spin.pack(side="left", padx=(6, 18))
+        return spin
+
     def _build_zoom_controls(self, parent: ttk.Frame) -> None:
         column = ttk.Frame(parent)
         column.grid(row=2, column=1, sticky="ns")
@@ -195,11 +234,13 @@ class App(tk.Tk):
             "plus": _zoom_icon("plus"),
             "reset": _zoom_icon("reset"),
             "minus": _zoom_icon("minus"),
+            "rescan": _zoom_icon("rescan"),
         }
         commands = (
             ("plus", lambda: self._zoom_by(1.25)),
             ("reset", self._view_original),
             ("minus", lambda: self._zoom_by(1 / 1.25)),
+            ("rescan", self._rescan),
         )
         for name, command in commands:
             tk.Button(
@@ -226,28 +267,137 @@ class App(tk.Tk):
         if path:
             self._load_path(path)
 
+    def _enable_file_drop(self) -> None:
+        self._drop_hover = False
+        self._drop_overlay = tk.Frame(self, bg="#e8f1fb")
+        card = tk.Frame(
+            self._drop_overlay,
+            bg="#e8f1fb",
+            highlightbackground="#1d4e89",
+            highlightthickness=3,
+        )
+        card.place(relx=0.03, rely=0.03, relwidth=0.94, relheight=0.94)
+        tk.Label(
+            card,
+            text="Drop barcode image",
+            bg="#e8f1fb",
+            fg="#1d4e89",
+            font=("Segoe UI", 22, "bold"),
+        ).place(relx=0.5, rely=0.46, anchor="center")
+        tk.Label(
+            card,
+            text="Release to upload",
+            bg="#e8f1fb",
+            fg="#52606d",
+            font=("Segoe UI", 12),
+        ).place(relx=0.5, rely=0.56, anchor="center")
+        self._register_drop_target(self)
+
+    def _register_drop_target(self, widget: tk.Misc) -> None:
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+            widget.dnd_bind("<<DropPosition>>", self._on_drop_position)
+            widget.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+        except tk.TclError:
+            return
+        for child in widget.winfo_children():
+            self._register_drop_target(child)
+
+    def _on_drop_enter(self, event):
+        self._drop_hover = True
+        self._drop_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._drop_overlay.lift()
+        return getattr(event, "action", None) or "copy"
+
+    def _on_drop_position(self, event):
+        self._drop_hover = True
+        return getattr(event, "action", None) or "copy"
+
+    def _on_drop_leave(self, _event):
+        self._drop_hover = False
+        self.after(120, self._hide_drop_overlay)
+
+    def _hide_drop_overlay(self) -> None:
+        if not self._drop_hover:
+            self._drop_overlay.place_forget()
+
+    def _on_drop(self, event):
+        self._drop_hover = False
+        self._drop_overlay.place_forget()
+        self._on_files_dropped(list(self.tk.splitlist(event.data)))
+        return getattr(event, "action", None) or "copy"
+
+    def _on_files_dropped(self, paths: list[str]) -> None:
+        if self._busy:
+            return
+        images = [path for path in paths if Path(path).suffix.lower() in _IMAGE_SUFFIXES]
+        if not images:
+            messagebox.showinfo("Not an image", "Drop a barcode image, such as a PNG or JPEG.")
+            return
+        self._load_path(images[0])
+
+    def _take_screenshot(self) -> None:
+        if self._busy:
+            return
+        self.withdraw()
+        self.after(300, self._capture_screen)
+
+    def _capture_screen(self) -> None:
+        try:
+            shot = ImageGrab.grab(all_screens=True).convert("RGB")
+        except Exception as exc:
+            self._restore_window()
+            messagebox.showerror("Screenshot failed", str(exc))
+            return
+        left, top = _virtual_screen_origin()
+        _ScreenSnip(self, shot, left, top, self._on_snip_done)
+
+    def _on_snip_done(self, image: Image.Image | None) -> None:
+        self._restore_window()
+        if image is None:
+            self.status.configure(text="Screenshot canceled.")
+            return
+        self._load_image(image, "screenshot")
+
+    def _restore_window(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
     def _load_path(self, path: str) -> None:
         try:
             image = Image.open(path).convert("RGB")
         except Exception as exc:
             messagebox.showerror("Could not open image", str(exc))
             return
+        self._load_image(image, Path(path).name)
+
+    def _rescan(self) -> None:
+        if self._busy:
+            return
+        if self.source_image is None:
+            self.status.configure(text="Upload a barcode first, then rescan it.")
+            return
+        self._load_image(self.source_image, "the current image", keep_view=True)
+
+    def _load_image(self, image: Image.Image, label: str, *, keep_view: bool = False) -> None:
         self.source_image = image
         self.generated_image = None
         self.generated_dirty = False
         self.original_bytes = None
         self.original_text = ""
         self.original_is_binary = False
-        self.layout_rows = None
-        self.layout_columns = None
-        self.layout_security = None
-        self.details.configure(text="Rows, columns, and error correction appear after a barcode is read.")
+        self._set_layout_fields(None, None, None)
+        self._show_result(None, None, None)
         self._set_text("")
-        self._reset_view()
+        if not keep_view:
+            self._reset_view()
         self._show_image("source", image)
         self._show_placeholder("generated", "Generate a barcode to preview it here")
-        self._set_busy(True, f"Reading barcode from {Path(path).name}...", value=35)
-        threading.Thread(target=self._decode_worker, args=(path,), daemon=True).start()
+        self._set_busy(True, f"Reading barcode from {label}...", value=35)
+        threading.Thread(target=self._decode_worker, args=(image.copy(),), daemon=True).start()
 
     def _poll_events(self) -> None:
         try:
@@ -265,9 +415,9 @@ class App(tk.Tk):
             pass
         self.after(50, self._poll_events)
 
-    def _decode_worker(self, path: str) -> None:
+    def _decode_worker(self, image: Image.Image) -> None:
         try:
-            result = decode_path(path)
+            result = decode_image(image)
         except Exception as exc:
             self._events.put(("decode-error", exc))
             return
@@ -288,11 +438,9 @@ class App(tk.Tk):
         self.original_text = symbol.text
         self.original_bytes = symbol.raw_bytes
         self.original_is_binary = symbol.content_type.lower() in {"binary", "mixed", "unknowneci"}
-        self.layout_rows = symbol.rows
-        self.layout_columns = symbol.columns
-        self.layout_security = symbol.security_level
+        self._set_layout_fields(symbol.columns, symbol.rows, symbol.security_level)
+        self._show_result(symbol.rows, symbol.columns, symbol.security_level)
         self._set_text(symbol.text)
-        self.details.configure(text=f"{_layout_text(symbol)}    Payload: {len(symbol.raw_bytes)} bytes")
         extra = ""
         if len(result.symbols) > 1:
             extra = f" Found {len(result.symbols)} barcodes; showing the first."
@@ -329,10 +477,17 @@ class App(tk.Tk):
                     "The content has characters outside the original payload encoding.",
                 )
                 return
+        try:
+            columns = self._read_layout_field(self.columns_var, 1, 30, "Columns")
+            rows = self._read_layout_field(self.rows_var, 3, 90, "Rows")
+            security = self._read_layout_field(self.security_var, 0, 8, "Error correction")
+        except ValueError as exc:
+            messagebox.showerror("Check the layout", str(exc))
+            return
         self._set_busy(True, f"Generating barcode from {len(raw)} bytes...", value=45)
         threading.Thread(
             target=self._generate_original,
-            args=(raw, self.layout_rows, self.layout_columns, self.layout_security),
+            args=(raw, rows, columns, security),
             daemon=True,
         ).start()
 
@@ -344,31 +499,34 @@ class App(tk.Tk):
         security: int | None,
     ) -> None:
         try:
-            image, options = _generate_full_content(raw, rows, columns, security)
+            columns, rows = legal_symbol_size(columns, rows)
+            image, options = generate_fitted(
+                raw.decode("latin-1"),
+                columns=columns,
+                rows=rows,
+                ec_level=2 if security is None else security,
+                scale=4,
+                eci=None,
+            )
         except Exception as exc:
             self._events.put(("generate-error", exc))
             return
         self._events.put(("generated", (image, options, rows)))
 
     def _generate_done(self, payload) -> None:
-        image, options, requested_rows = payload
+        image, options, _requested_rows = payload
         self.generated_image = image
         self.generated_dirty = False
         self._show_image("generated", image)
-        drawn = _describe_generated(image, options)
-        if drawn is not None:
-            self.details.configure(text=drawn)
-        rows = options.rows
-        columns = options.columns
-        level = options.ec_level
+        measured = _measured_symbol(image)
+        self._fill_blank_layout(measured)
+        rows = measured.rows if measured and measured.rows else options.rows
+        columns = measured.columns if measured and measured.columns else options.columns
+        level = measured.security_level if measured and measured.security_level is not None else options.ec_level
         if rows and columns:
-            size = f"{rows} rows, {columns} columns, error correction {level}"
-            if requested_rows and rows == requested_rows:
-                message = f"Generated the full payload with the scanned layout: {size}. Click Save to write the image."
-            else:
-                message = f"Generated the full payload: {size}. Click Save to write the image."
-        else:
-            message = "Barcode generated. Click Save to write the image."
+            self._set_layout_fields(columns, rows, level if level is not None else options.ec_level)
+        self._show_result(rows, columns, level)
+        message = "Generated the full payload. Click Save to write the image."
         self._set_busy(False, message, value=100)
         self._refresh_buttons()
 
@@ -381,7 +539,7 @@ class App(tk.Tk):
         if self.generated_image is None or self._busy:
             return
         if self.generated_dirty:
-            messagebox.showinfo("Generate again", "The content changed. Click Generate before saving.")
+            messagebox.showinfo("Generate again", "The content or layout changed. Click Generate before saving.")
             return
         path = filedialog.asksaveasfilename(
             title="Save barcode",
@@ -612,6 +770,54 @@ class App(tk.Tk):
             self.status.configure(text="Content changed. Click Generate to update the barcode.")
         self._refresh_buttons()
 
+    def _show_result(self, rows: int | None, columns: int | None, level: int | None) -> None:
+        if rows and columns and level is not None:
+            text = f"{rows} rows, {columns} columns, error correction {level}"
+        elif rows and columns:
+            text = f"{rows} rows, {columns} columns"
+        else:
+            text = ""
+        self.result.configure(text=text)
+
+    def _set_layout_fields(self, columns: int | None, rows: int | None, security: int | None) -> None:
+        self._ignore_layout = True
+        self.columns_var.set("" if columns is None else str(columns))
+        self.rows_var.set("" if rows is None else str(rows))
+        self.security_var.set("" if security is None else str(security))
+        self._ignore_layout = False
+
+    def _fill_blank_layout(self, symbol: Pdf417Symbol | None) -> None:
+        if symbol is None:
+            return
+        self._ignore_layout = True
+        if not self.columns_var.get().strip() and symbol.columns:
+            self.columns_var.set(str(symbol.columns))
+        if not self.rows_var.get().strip() and symbol.rows:
+            self.rows_var.set(str(symbol.rows))
+        if not self.security_var.get().strip() and symbol.security_level is not None:
+            self.security_var.set(str(symbol.security_level))
+        self._ignore_layout = False
+
+    def _read_layout_field(self, variable: tk.StringVar, low: int, high: int, name: str) -> int | None:
+        text = variable.get().strip()
+        if not text:
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number.") from None
+        if not low <= value <= high:
+            raise ValueError(f"{name} must be from {low} to {high}.")
+        return value
+
+    def _on_layout_changed(self, *_args) -> None:
+        if self._ignore_layout:
+            return
+        if self.generated_image is not None:
+            self.generated_dirty = True
+            self.status.configure(text="Layout changed. Click Generate to update the barcode.")
+        self._refresh_buttons()
+
     def _set_busy(self, busy: bool, message: str, value: int = 0) -> None:
         self._busy = busy
         self._stop_progress()
@@ -654,7 +860,11 @@ class App(tk.Tk):
         text = self.content.get("1.0", "end-1c").strip()
         can_generate = not self._busy and (bool(text) or self.original_is_binary)
         can_save = not self._busy and self.generated_image is not None and not self.generated_dirty
-        self.upload_button.configure(state="disabled" if self._busy else "normal")
+        state = "disabled" if self._busy else "normal"
+        self.upload_button.configure(state=state)
+        self.screenshot_button.configure(state=state)
+        for spin in self._layout_spins:
+            spin.configure(state=state)
         self.generate_button.configure(state="normal" if can_generate else "disabled")
         self.save_button.configure(state="normal" if can_save else "disabled")
 
@@ -686,6 +896,87 @@ def payload_from_text(text: str) -> bytes:
     return _CONTROL_TAG.sub(replace, text).encode("latin-1")
 
 
+class _ScreenSnip(tk.Toplevel):
+    """Full-screen overlay for dragging a box around part of a screenshot."""
+
+    MIN_SIZE = 8
+
+    def __init__(self, master: tk.Tk, shot: Image.Image, left: int, top: int, on_done) -> None:
+        super().__init__(master)
+        self._shot = shot
+        self._on_done = on_done
+        self._start: tuple[int, int] | None = None
+        self._box: int | None = None
+        self._finished = False
+
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.geometry(f"{shot.width}x{shot.height}+{left}+{top}")
+        self.configure(cursor="crosshair")
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, cursor="crosshair")
+        self._canvas.pack(fill="both", expand=True)
+        dimmed = ImageEnhance.Brightness(shot).enhance(0.6)
+        self._photo = ImageTk.PhotoImage(dimmed)
+        self._canvas.create_image(0, 0, image=self._photo, anchor="nw")
+        self._canvas.create_text(
+            shot.width // 2,
+            40,
+            text="Drag around the barcode. Click once for the whole screen. Esc cancels.",
+            fill="#ffffff",
+            font=("Segoe UI", 14, "bold"),
+        )
+
+        self._canvas.bind("<ButtonPress-1>", self._on_press)
+        self._canvas.bind("<B1-Motion>", self._on_move)
+        self._canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._canvas.bind("<ButtonPress-3>", lambda _event: self._finish(None))
+        self.bind("<Escape>", lambda _event: self._finish(None))
+        self.after(50, self.focus_force)
+
+    def _on_press(self, event) -> None:
+        self._start = (event.x, event.y)
+        if self._box is not None:
+            self._canvas.delete(self._box)
+        self._box = self._canvas.create_rectangle(
+            event.x, event.y, event.x, event.y, outline="#4da3ff", width=2
+        )
+
+    def _on_move(self, event) -> None:
+        if self._start is None or self._box is None:
+            return
+        self._canvas.coords(self._box, self._start[0], self._start[1], event.x, event.y)
+
+    def _on_release(self, event) -> None:
+        if self._start is None:
+            return
+        x0, y0 = self._start
+        left, right = sorted((max(0, x0), min(self._shot.width, event.x)))
+        top, bottom = sorted((max(0, y0), min(self._shot.height, event.y)))
+        if right - left < self.MIN_SIZE or bottom - top < self.MIN_SIZE:
+            self._finish(self._shot)
+            return
+        self._finish(self._shot.crop((left, top, right, bottom)))
+
+    def _finish(self, image: Image.Image | None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.destroy()
+        self._on_done(image)
+
+
+def _virtual_screen_origin() -> tuple[int, int]:
+    """Top-left of the area that ImageGrab.grab(all_screens=True) covers."""
+    try:
+        import ctypes
+
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        return metrics(76), metrics(77)
+    except Exception:
+        return 0, 0
+
+
 def _zoom_icon(kind: str) -> ImageTk.PhotoImage:
     from PIL import ImageDraw
 
@@ -698,6 +989,8 @@ def _zoom_icon(kind: str) -> ImageTk.PhotoImage:
         draw.rectangle((4, 9, 17, 12), fill=ink)
     elif kind == "minus":
         draw.rectangle((4, 9, 17, 12), fill=ink)
+    elif kind == "rescan":
+        return ImageTk.PhotoImage(_rescan_icon(size, ink))
     else:
         draw.rectangle((3, 3, 9, 5), fill=ink)
         draw.rectangle((3, 3, 5, 9), fill=ink)
@@ -708,6 +1001,39 @@ def _zoom_icon(kind: str) -> ImageTk.PhotoImage:
         draw.rectangle((12, 16, 18, 18), fill=ink)
         draw.rectangle((16, 12, 18, 18), fill=ink)
     return ImageTk.PhotoImage(image)
+
+
+def _rescan_icon(size: int, ink: tuple[int, int, int, int]) -> Image.Image:
+    """Circular arrow, drawn large and scaled down so the curve stays smooth."""
+    from PIL import ImageDraw
+
+    big = size * 4
+    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    center = big / 2
+    radius = big * 0.3
+    draw.arc(
+        (center - radius, center - radius, center + radius, center + radius),
+        start=30,
+        end=300,
+        fill=ink,
+        width=int(big * 0.1),
+    )
+    end = math.radians(300)
+    tip_x = center + radius * math.cos(end)
+    tip_y = center + radius * math.sin(end)
+    forward = (-math.sin(end), math.cos(end))
+    outward = (math.cos(end), math.sin(end))
+    head = big * 0.17
+    draw.polygon(
+        [
+            (tip_x + forward[0] * head, tip_y + forward[1] * head),
+            (tip_x + outward[0] * head, tip_y + outward[1] * head),
+            (tip_x - outward[0] * head, tip_y - outward[1] * head),
+        ],
+        fill=ink,
+    )
+    return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def _layout_text(symbol: Pdf417Symbol) -> str:
@@ -792,6 +1118,16 @@ def _describe_generated(image: Image.Image, options: GenerateOptions) -> str | N
         symbol.security_level = options.ec_level
     text = _layout_text(symbol)
     return f"{text}    Payload: {len(symbol.raw_bytes)} bytes"
+
+
+def _measured_symbol(image: Image.Image) -> Pdf417Symbol | None:
+    try:
+        found = decode_image(image)
+    except Exception:
+        return None
+    if not found.symbols:
+        return None
+    return found.symbols[0]
 
 
 def _measured_bytes(image: Image.Image) -> bytes | None:
