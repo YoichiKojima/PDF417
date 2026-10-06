@@ -35,7 +35,7 @@ python pdf417.pyw
 ```
 
 1. Click **Upload Your Bar code** and choose an image. Clicking the empty left preview does the same thing. You can also drop an image from Explorer onto the window, or click **Screenshot**: the window hides, and you drag a box around a barcode anywhere on screen. A single click uses the whole screen, and Esc cancels.
-2. The original appears on the left while the progress bar runs. The decoded payload fills **Content**, with the measured rows, columns, and error correction above it. A soft or blurry photo is sharpened and enlarged automatically when the first read misses. If the bars have smeared into each other, the scan can still fail.
+2. The original appears on the left while the progress bar runs. The decoded payload fills **Content**, with the measured rows, columns, and error correction above it. When the first read misses, the scanner measures how far the barcode is tilted, straightens it, and tries again. It also crops to the barcode when the photo has a busy background, enlarges small screenshots whose bars are only about a pixel wide, and retries light-on-dark barcodes inverted. A straight, clean image reads instantly. A tilted photo takes a fraction of a second, and a large phone photo can take a second or two. If the bars have smeared into each other, the scan can still fail.
 3. Edit the content if you want, then click **Generate**. The new barcode appears on the right. Clicking the empty right preview moves the cursor into **Content**.
 4. Click **Save**. A PNG keeps the bars and makes the background transparent. JPEG and BMP are saved as normal images.
 
