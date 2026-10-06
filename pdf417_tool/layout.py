@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import groupby
 from statistics import median
 
-from PIL import Image
+from PIL import Image, ImageFilter
+
+from .indicator_table import INDICATOR_PATTERNS
 
 
 @dataclass
@@ -38,6 +41,14 @@ def measure_layout(
 ) -> Pdf417Layout:
     layout = Pdf417Layout(ec_percent=(ec_percent or "").strip())
     try:
+        exact = read_row_indicators(image, position)
+    except Exception:
+        exact = None
+    if exact is not None:
+        layout.rows, layout.columns, layout.security_level = exact
+        layout.ec_codewords = 2 << layout.security_level
+        return layout
+    try:
         symbol = _isolate_symbol(image, position)
     except Exception:
         return layout
@@ -61,6 +72,167 @@ def measure_layout(
         if layout.security_level is not None:
             layout.ec_codewords = 2 << layout.security_level
     return layout
+
+
+_START = (8, 1, 1, 1, 1, 1, 1, 3)
+_STOP = (7, 1, 1, 3, 1, 1, 1, 2, 1)
+_INDICATOR_MIN_WIDTH = 1600
+
+
+def read_row_indicators(
+    image: Image.Image, position: dict[str, dict[str, int]]
+) -> tuple[int, int, int] | None:
+    """Read rows, columns, and error level from the symbol's row indicator codewords.
+
+    Every row starts and ends with a codeword that carries one of the three
+    values, so a vote across scanlines gives them exactly instead of estimating
+    them from the module width.
+    """
+    symbol = _isolate_symbol(image, position, pad=0.04)
+    if symbol.width < _INDICATOR_MIN_WIDTH:
+        factor = min(6, -(-_INDICATOR_MIN_WIDTH // symbol.width))
+        symbol = symbol.resize((symbol.width * factor, symbol.height), Image.Resampling.LANCZOS)
+    for candidate in (symbol, symbol.rotate(180)):
+        for dark_is_bar in (True, False):
+            found = _vote_indicators(candidate, dark_is_bar, _otsu(candidate))
+            if found is not None:
+                return found
+    # Blur swallows the one-module bars and spaces; sharpening brings them back,
+    # and the right threshold then depends on how far the ink spread.
+    for candidate in (symbol, symbol.rotate(180)):
+        sharpened = candidate.filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=0))
+        threshold = _otsu(sharpened)
+        for dark_is_bar in (True, False):
+            for offset in (0, -30, 30, -60, 60):
+                found = _vote_indicators(sharpened, dark_is_bar, max(1, min(254, threshold + offset)))
+                if found is not None:
+                    return found
+    return None
+
+
+def _vote_indicators(symbol: Image.Image, dark_is_bar: bool, threshold: int) -> tuple[int, int, int] | None:
+    width, height = symbol.size
+    data = symbol.tobytes()
+    # rows_part = (rows - 1) // 3, level_part = level * 3 + (rows - 1) % 3, columns_part = columns - 1
+    votes: dict[str, dict[int, int]] = {"rows": {}, "level": {}, "columns": {}}
+    row_groups: dict[tuple[str, int], int] = {}
+    spans: list[float] = []
+    left_kinds = ("rows", "level", "columns")
+    right_kinds = ("columns", "rows", "level")
+
+    def vote(kind: str, value: int) -> None:
+        bucket = votes[kind]
+        bucket[value % 30] = bucket.get(value % 30, 0) + 1
+        key = (kind, value % 30)
+        row_groups[key] = max(row_groups.get(key, 0), value // 30)
+
+    step = max(1, height // 150)
+    for y in range(0, height, step):
+        line = data[y * width : (y + 1) * width]
+        runs = [(bar, len(list(group))) for bar, group in groupby((value <= threshold) == dark_is_bar for value in line)]
+        start = _find_pattern(runs, _START, from_left=True, limit=width * 0.3)
+        if start is not None and start + 16 <= len(runs):
+            found = _indicator_value(runs, start, start + 8)
+            if found is not None:
+                vote(left_kinds[found[0]], found[1])
+        stop = _find_pattern(runs, _STOP, from_left=False, limit=width * 0.3)
+        if stop is not None and stop >= 8:
+            found = _indicator_value(runs, stop, stop - 8)
+            if found is not None:
+                vote(right_kinds[found[0]], found[1])
+        if start is not None and stop is not None and stop > start:
+            start_px = sum(length for _bar, length in runs[start : start + len(_START)])
+            stop_px = sum(length for _bar, length in runs[stop : stop + len(_STOP)])
+            unit = (start_px + stop_px) / (sum(_START) + sum(_STOP))
+            span = sum(length for _bar, length in runs[start : stop + len(_STOP)])
+            spans.append(span / unit)
+
+    winners: dict[str, int] = {}
+    for kind, bucket in votes.items():
+        if not bucket:
+            return None
+        value, count = max(bucket.items(), key=lambda item: item[1])
+        if count < 2 or count < 0.6 * sum(bucket.values()):
+            return None
+        winners[kind] = value
+    rows = 3 * winners["rows"] + winners["level"] % 3 + 1
+    level = winners["level"] // 3
+    columns = winners["columns"] + 1
+    if not (3 <= rows <= 90 and 1 <= columns <= 30 and rows * columns <= 928 and level <= 8):
+        return None
+    # Misread patterns can still agree by chance on a blurred scan, so the
+    # result has to fit the row numbers the indicators carry and the symbol's
+    # measured width in modules.
+    if any(row_groups[(kind, value)] > (rows - 1) // 3 for kind, value in winners.items()):
+        return None
+    if spans and abs(median(spans) - (17 * columns + 69)) > 8.5:
+        return None
+    return rows, columns, level
+
+
+def _find_pattern(runs: list[tuple[bool, int]], pattern: tuple[int, ...], *, from_left: bool, limit: float) -> int | None:
+    """Index of the first run of a bar pattern near one end of a scanline."""
+    count = len(pattern)
+    modules = sum(pattern)
+    last = len(runs) - count
+    indexes = range(last + 1) if from_left else range(last, -1, -1)
+    travelled = 0
+    for index in indexes:
+        if from_left and index:
+            travelled += runs[index - 1][1]
+        elif not from_left and index < last:
+            travelled += runs[index + count][1]
+        if travelled > limit:
+            return None
+        if not runs[index][0]:
+            continue
+        widths = [length for _bar, length in runs[index : index + count]]
+        unit = sum(widths) / modules
+        if unit <= 0:
+            continue
+        if all(abs(width / unit - expected) <= 0.75 for width, expected in zip(widths, pattern)):
+            return index
+    return None
+
+
+def _indicator_value(runs: list[tuple[bool, int]], guide: int, first: int) -> tuple[int, int] | None:
+    """Cluster index and value of the codeword at runs[first:first + 8].
+
+    The neighbouring start or stop pattern at runs[guide] has known widths, so
+    it tells how much wider bars print than they should; that bleed is taken
+    back off the codeword before its widths are rounded to modules.
+    """
+    pattern = _START if guide == first - 8 else _STOP
+    guide_runs = runs[guide : guide + len(pattern)]
+    unit = sum(length for _bar, length in guide_runs) / sum(pattern)
+    bar_excess = sum(length - expected * unit for (bar, length), expected in zip(guide_runs, pattern) if bar)
+    bleed = bar_excess / sum(1 for bar, _length in guide_runs if bar) if unit > 0 else 0.0
+
+    codeword = runs[first : first + 8]
+    if len(codeword) != 8 or not codeword[0][0]:
+        return None
+    widths = [length - bleed if bar else length + bleed for bar, length in codeword]
+    total = sum(widths)
+    if total <= 0:
+        return None
+    scaled = [max(0.0, width * 17 / total) for width in widths]
+    modules = [max(1, min(6, int(round(value)))) for value in scaled]
+    while sum(modules) != 17:
+        if sum(modules) > 17:
+            choices = [i for i in range(8) if modules[i] > 1]
+            index = min(choices, key=lambda i: scaled[i] - modules[i])
+            modules[index] -= 1
+        else:
+            choices = [i for i in range(8) if modules[i] < 6]
+            index = max(choices, key=lambda i: scaled[i] - modules[i])
+            modules[index] += 1
+    cluster = (modules[0] - modules[2] + modules[4] - modules[6] + 9) % 9
+    if cluster % 3:
+        return None
+    value = INDICATOR_PATTERNS[cluster // 3].get("".join(map(str, modules)))
+    if value is None:
+        return None
+    return cluster // 3, value
 
 
 def _match_reported_layout(
@@ -100,9 +272,11 @@ def _match_reported_layout(
     return rows, columns, level
 
 
-def _isolate_symbol(image: Image.Image, position: dict[str, dict[str, int]]) -> Image.Image:
+def _isolate_symbol(image: Image.Image, position: dict[str, dict[str, int]], *, pad: float = 0.0) -> Image.Image:
     names = ("top_left", "top_right", "bottom_right", "bottom_left")
     corners = [(float(position[name]["x"]), float(position[name]["y"])) for name in names]
+    if pad:
+        corners = _widened(corners, pad)
     if _axis_aligned(corners):
         xs = [point[0] for point in corners]
         ys = [point[1] for point in corners]
@@ -272,6 +446,16 @@ def _axis_aligned(corners: list[tuple[float, float]]) -> bool:
         and abs(top_left[0] - bottom_left[0]) <= max(3.0, height * 0.02)
         and abs(top_right[0] - bottom_right[0]) <= max(3.0, height * 0.02)
     )
+
+
+def _widened(corners: list[tuple[float, float]], fraction: float) -> list[tuple[float, float]]:
+    """Push the left and right edges outward so the start and stop patterns are not clipped."""
+    top_left, top_right, bottom_right, bottom_left = corners
+
+    def push(inner, outer):
+        return (outer[0] + (outer[0] - inner[0]) * fraction, outer[1] + (outer[1] - inner[1]) * fraction)
+
+    return [push(top_right, top_left), push(top_left, top_right), push(bottom_left, bottom_right), push(bottom_right, bottom_left)]
 
 
 def _warp(image: Image.Image, corners: list[tuple[float, float]]) -> Image.Image:
