@@ -919,13 +919,10 @@ class _ScreenSnip(tk.Toplevel):
         dimmed = ImageEnhance.Brightness(shot).enhance(0.6)
         self._photo = ImageTk.PhotoImage(dimmed)
         self._canvas.create_image(0, 0, image=self._photo, anchor="nw")
-        self._canvas.create_text(
-            shot.width // 2,
-            40,
-            text="Drag around the barcode. Click once for the whole screen. Esc cancels.",
-            fill="#ffffff",
-            font=("Segoe UI", 14, "bold"),
-        )
+        # The selection shows the undimmed screenshot, copied in by Tk on each move.
+        self._bright = ImageTk.PhotoImage(shot)
+        self._selection = tk.PhotoImage(master=self, width=1, height=1)
+        self._selection_item = self._canvas.create_image(0, 0, image=self._selection, anchor="nw", state="hidden")
 
         self._canvas.bind("<ButtonPress-1>", self._on_press)
         self._canvas.bind("<B1-Motion>", self._on_move)
@@ -938,6 +935,7 @@ class _ScreenSnip(tk.Toplevel):
         self._start = (event.x, event.y)
         if self._box is not None:
             self._canvas.delete(self._box)
+        self._canvas.itemconfigure(self._selection_item, state="hidden")
         self._box = self._canvas.create_rectangle(
             event.x, event.y, event.x, event.y, outline="#4da3ff", width=2
         )
@@ -946,6 +944,18 @@ class _ScreenSnip(tk.Toplevel):
         if self._start is None or self._box is None:
             return
         self._canvas.coords(self._box, self._start[0], self._start[1], event.x, event.y)
+        left, right = sorted((max(0, self._start[0]), max(0, min(self._shot.width, event.x))))
+        top, bottom = sorted((max(0, self._start[1]), max(0, min(self._shot.height, event.y))))
+        if right - left < 1 or bottom - top < 1:
+            self._canvas.itemconfigure(self._selection_item, state="hidden")
+            return
+        self._selection.configure(width=right - left, height=bottom - top)
+        self._selection.tk.call(
+            str(self._selection), "copy", str(self._bright), "-from", left, top, right, bottom, "-to", 0, 0
+        )
+        self._canvas.coords(self._selection_item, left, top)
+        self._canvas.itemconfigure(self._selection_item, state="normal")
+        self._canvas.tag_raise(self._box)
 
     def _on_release(self, event) -> None:
         if self._start is None:
