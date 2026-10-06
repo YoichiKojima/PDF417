@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import re
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -16,6 +17,7 @@ from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 
 from .decode import Pdf417Symbol, decode_image
 from .encode import GenerateOptions, generate_fitted, legal_symbol_size, with_transparent_background
+from .icon import app_icon
 
 PREVIEW_WIDTH = 460
 PREVIEW_HEIGHT = 250
@@ -59,10 +61,18 @@ class App(TkinterDnD.Tk):
         self._drag: tuple[str, int, int] | None = None
         self._wheel_target: str | None = None
         self._space_down = False
+        self._snipping = False
+        self._tray = None
+        self._in_tray = False
 
+        self._window_icon = ImageTk.PhotoImage(app_icon(64))
+        self.iconphoto(True, self._window_icon)
         self._build()
         self._bind_space()
         self._enable_file_drop()
+        self._start_screenshot_hotkey()
+        self._start_tray()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_buttons()
         self.after(50, self._poll_events)
 
@@ -338,9 +348,71 @@ class App(TkinterDnD.Tk):
             return
         self._load_path(images[0])
 
-    def _take_screenshot(self) -> None:
-        if self._busy:
+    def _start_screenshot_hotkey(self) -> None:
+        if sys.platform == "win32":
+            threading.Thread(target=self._screenshot_hotkey_loop, daemon=True).start()
+
+    def _screenshot_hotkey_loop(self) -> None:
+        # Windows delivers the hotkey to the thread that registered it, so this
+        # thread owns the registration and only hands the press to the Tk loop.
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        mod_alt, mod_norepeat, vk_s, wm_hotkey = 0x0001, 0x4000, 0x53, 0x0312
+        if not user32.RegisterHotKey(None, 1, mod_alt | mod_norepeat, vk_s):
+            self._events.put(("hotkey-unavailable", None))
             return
+        message = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            if message.message == wm_hotkey:
+                self._events.put(("screenshot-hotkey", None))
+        user32.UnregisterHotKey(None, 1)
+
+    def _start_tray(self) -> None:
+        try:
+            import pystray
+        except Exception:
+            return
+
+        def send(kind: str):
+            return lambda _icon, _item: self._events.put((kind, None))
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Screenshot\tAlt+S", send("screenshot-hotkey")),
+            pystray.MenuItem("Show window", send("tray-show"), default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", send("tray-exit")),
+        )
+        try:
+            self._tray = pystray.Icon("PDF417", app_icon(64), "PDF417 Barcode", menu)
+            # Callbacks arrive on the tray thread and only queue events for Tk.
+            threading.Thread(target=self._tray.run, daemon=True).start()
+        except Exception:
+            self._tray = None
+
+    def _on_close(self) -> None:
+        if self._tray is None:
+            self._quit()
+            return
+        self.withdraw()
+        self._in_tray = True
+
+    def _quit(self) -> None:
+        if self._tray is not None:
+            try:
+                # stop() hides the icon from the tray thread, which may not run
+                # before the process exits and leaves a ghost icon behind.
+                self._tray.visible = False
+                self._tray.stop()
+            except Exception:
+                pass
+        self.destroy()
+
+    def _take_screenshot(self) -> None:
+        if self._busy or self._snipping:
+            return
+        self._snipping = True
         self.withdraw()
         self.after(300, self._capture_screen)
 
@@ -348,6 +420,7 @@ class App(TkinterDnD.Tk):
         try:
             shot = ImageGrab.grab(all_screens=True).convert("RGB")
         except Exception as exc:
+            self._snipping = False
             self._restore_window()
             messagebox.showerror("Screenshot failed", str(exc))
             return
@@ -355,13 +428,17 @@ class App(TkinterDnD.Tk):
         _ScreenSnip(self, shot, left, top, self._on_snip_done)
 
     def _on_snip_done(self, image: Image.Image | None) -> None:
-        self._restore_window()
+        self._snipping = False
         if image is None:
             self.status.configure(text="Screenshot canceled.")
+            if not self._in_tray:
+                self._restore_window()
             return
+        self._restore_window()
         self._load_image(image, "screenshot")
 
     def _restore_window(self) -> None:
+        self._in_tray = False
         self.deiconify()
         self.lift()
         self.focus_force()
@@ -411,6 +488,15 @@ class App(TkinterDnD.Tk):
                     self._generate_done(payload)
                 elif kind == "generate-error":
                     self._generate_failed(payload)
+                elif kind == "screenshot-hotkey":
+                    self._take_screenshot()
+                elif kind == "tray-show":
+                    self._restore_window()
+                elif kind == "tray-exit":
+                    self._quit()
+                    return
+                elif kind == "hotkey-unavailable":
+                    self.status.configure(text="Alt+S is taken by another app, so the screenshot hotkey is off.")
         except queue.Empty:
             pass
         self.after(50, self._poll_events)
