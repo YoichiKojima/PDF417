@@ -32,6 +32,50 @@ SAVE_TYPES = [
 ]
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 
+# Driver-license elements. Each one is stored as <LF>CODE + value + <LF>.
+_LICENSE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("DAC", "First name"),
+    ("DAD", "Mid name"),
+    ("DCS", "Last name"),
+    ("DBD", "Issue date"),
+    ("DBB", "Birthday"),
+    ("DBA", "Expired date"),
+    ("DAG", "Street"),
+    ("DAI", "County"),
+    ("DAJ", "State"),
+    ("DAK", "Zip code"),
+    ("DCG", "Country"),
+    ("DCF", "DD"),
+)
+_FIELD_COLUMNS = 3
+_FIELD_BOUNDARY = re.compile(r"\r\n|\n|\r|<LF>|<CR>", re.IGNORECASE)
+
+
+def find_license_fields(text: str) -> dict[str, tuple[int, int, str]]:
+    """Return each element found in ``text``.
+
+    The code has to start a segment, right after a line break (or at the
+    beginning). The value is everything after the code until the next break.
+    Real newlines and ``<LF>`` / ``<CR>`` tags both count, since that is how
+    the content box shows the payload. The result maps a code to
+    ``(value start, value end, value)`` in ``text``.
+    """
+
+    found: dict[str, tuple[int, int, str]] = {}
+    last = 0
+    cuts = [(match.start(), match.end()) for match in _FIELD_BOUNDARY.finditer(text)]
+    cuts.append((len(text), len(text)))
+    for boundary, resume in cuts:
+        segment = text[last:boundary]
+        for code, _label in _LICENSE_FIELDS:
+            if code in found or not segment.startswith(code):
+                continue
+            value_start = last + len(code)
+            found[code] = (value_start, boundary, segment[len(code) :])
+            break
+        last = resume
+    return found
+
 
 class App(TkinterDnD.Tk):
     def __init__(self) -> None:
@@ -48,6 +92,13 @@ class App(TkinterDnD.Tk):
         self.original_is_binary = False
         self.generated_dirty = False
         self._ignore_layout = False
+        self._syncing_fields = False
+        self._fields_shown = False
+        self._fields_dialog: tk.Toplevel | None = None
+        self._dialog_content: tk.Text | None = None
+        self.field_vars: dict[str, tk.StringVar] = {}
+        self._field_widgets: dict[str, tuple[ttk.Label, ttk.Entry]] = {}
+        self._shown_fields: tuple[str, ...] = ()
         self.columns_var = tk.StringVar()
         self.rows_var = tk.StringVar()
         self.security_var = tk.StringVar()
@@ -88,6 +139,7 @@ class App(TkinterDnD.Tk):
         style.configure("Card.TLabelframe.Label", background="#f3f4f6", font=("Segoe UI", 10, "bold"))
         style.configure("Upload.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 10))
         style.configure("Action.TButton", font=("Segoe UI", 11), padding=(16, 8))
+        style.configure("Label.TButton", padding=(10, 1))
         style.configure("Preview.TLabel", background="#eef1f4", foreground="#52606d")
 
         root = ttk.Frame(self, padding=16)
@@ -160,8 +212,22 @@ class App(TkinterDnD.Tk):
         for variable in (self.columns_var, self.rows_var, self.security_var):
             variable.trace_add("write", self._on_layout_changed)
 
-        content_frame = ttk.LabelFrame(root, text="Content", padding=8)
+        content_frame = ttk.LabelFrame(root, padding=8)
         content_frame.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(4, 12))
+        content_label = ttk.Frame(content_frame, width=400, height=28)
+        content_label.grid_propagate(False)
+        content_label.columnconfigure(0, weight=1)
+        content_label.rowconfigure(0, weight=1)
+        ttk.Label(content_label, text="Content").grid(row=0, column=0, sticky="w")
+        self.details_button = ttk.Button(
+            content_label,
+            text="Details",
+            style="Label.TButton",
+            command=self._open_fields_dialog,
+        )
+        self.details_button.grid(row=0, column=1, sticky="e")
+        content_frame.configure(labelwidget=content_label)
+        content_frame.bind("<Configure>", lambda _event: self._fit_content_label(content_frame, content_label), add="+")
         content_frame.rowconfigure(0, weight=1)
         content_frame.columnconfigure(0, weight=1)
         self.content = tk.Text(
@@ -186,6 +252,203 @@ class App(TkinterDnD.Tk):
         self.generate_button.pack(side="left", padx=(0, 8))
         self.save_button = ttk.Button(actions, text="Save", style="Action.TButton", command=self._save)
         self.save_button.pack(side="left")
+
+    def _open_fields_dialog(self) -> None:
+        if self._dialog_alive() and self._fields_dialog is not None:
+            self._fields_dialog.lift()
+            self._fields_dialog.focus_force()
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Details")
+        dialog.configure(bg="#f3f4f6")
+        dialog.geometry("960x680")
+        dialog.minsize(760, 520)
+        dialog.transient(self)
+        dialog.iconphoto(False, self._window_icon)
+        self._fields_dialog = dialog
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        self.fields_frame = self._build_fields(body)
+
+        content_frame = ttk.LabelFrame(body, text="Content", padding=8)
+        content_frame.grid(row=1, column=0, sticky="nsew")
+        content_frame.rowconfigure(0, weight=1)
+        content_frame.columnconfigure(0, weight=1)
+        text = tk.Text(
+            content_frame,
+            wrap="char",
+            font=("Consolas", 11),
+            relief="flat",
+            undo=True,
+            height=8,
+            padx=8,
+            pady=8,
+        )
+        scroll = ttk.Scrollbar(content_frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.bind("<<Modified>>", self._on_dialog_modified)
+        self._dialog_content = text
+        self._ignore_modified = True
+        self._write_text(text, self.content.get("1.0", "end-1c"))
+        self._ignore_modified = False
+        self._sync_fields_from_content()
+
+        actions = ttk.Frame(body)
+        actions.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(actions, text="Save", style="Action.TButton", command=self._save_fields_dialog).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(actions, text="Cancel", style="Action.TButton", command=self._close_fields_dialog).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", self._close_fields_dialog)
+        dialog.bind("<Escape>", lambda _event: self._close_fields_dialog())
+        dialog.bind("<Control-s>", self._save_fields_shortcut)
+        dialog.bind("<Control-S>", self._save_fields_shortcut)
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        left = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        top = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{left}+{top}")
+        dialog.grab_set()
+        dialog.focus_force()
+
+    def _apply_fields_dialog(self) -> None:
+        """Write the open draft into Content and leave the window open."""
+        if self._dialog_content is None:
+            return
+        updated = self._dialog_content.get("1.0", "end-1c")
+        if updated == self.content.get("1.0", "end-1c"):
+            return
+        self._ignore_modified = True
+        self._write_text(self.content, updated)
+        self._ignore_modified = False
+        self._note_content_edited()
+
+    def _save_fields_shortcut(self, _event=None) -> str:
+        self._apply_fields_dialog()
+        return "break"
+
+    def _save_fields_dialog(self) -> None:
+        self._apply_fields_dialog()
+        self._close_fields_dialog()
+
+    def _fit_content_label(self, frame: ttk.LabelFrame, label: ttk.Frame) -> None:
+        width = frame.winfo_width()
+        if width <= 1:
+            return
+        target = max(width - 24, 160)
+        if str(label.cget("width")) != str(target):
+            label.configure(width=target)
+
+    def _close_fields_dialog(self) -> None:
+        dialog = self._fields_dialog
+        self._fields_dialog = None
+        self._dialog_content = None
+        self.field_vars = {}
+        self._field_widgets = {}
+        self._shown_fields = ()
+        self._fields_shown = False
+        if dialog is not None and dialog.winfo_exists():
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+    def _dialog_alive(self) -> bool:
+        return self._fields_dialog is not None and self._fields_dialog.winfo_exists()
+
+    def _build_fields(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text="Details", padding=(8, 6))
+        self.field_vars = {}
+        self._field_widgets = {}
+        self._shown_fields = ()
+        self._fields_shown = False
+        for column in range(1, _FIELD_COLUMNS * 2, 2):
+            frame.columnconfigure(column, weight=1)
+        for code, label in _LICENSE_FIELDS:
+            variable = tk.StringVar()
+            variable.trace_add("write", lambda *_args, key=code: self._on_field_write(key))
+            name = ttk.Label(frame, text=label)
+            entry = ttk.Entry(frame, textvariable=variable)
+            self.field_vars[code] = variable
+            self._field_widgets[code] = (name, entry)
+        return frame
+
+    def _layout_license_fields(self, visible: tuple[str, ...]) -> None:
+        for code, _label in _LICENSE_FIELDS:
+            name, entry = self._field_widgets[code]
+            if name.grid_info():
+                name.grid_remove()
+            if entry.grid_info():
+                entry.grid_remove()
+        if not visible:
+            if self._fields_shown:
+                self.fields_frame.grid_remove()
+                self._fields_shown = False
+            return
+        for index, code in enumerate(visible):
+            row, column = divmod(index, _FIELD_COLUMNS)
+            name, entry = self._field_widgets[code]
+            name.grid(row=row, column=column * 2, sticky="w", padx=(0, 6), pady=3)
+            entry.grid(row=row, column=column * 2 + 1, sticky="ew", padx=(0, 12), pady=3)
+        self.fields_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._fields_shown = True
+
+    def _sync_fields_from_content(self) -> None:
+        if self._syncing_fields or not self._dialog_alive() or self._dialog_content is None:
+            return
+        text = self._dialog_content.get("1.0", "end-1c")
+        found = find_license_fields(text)
+        visible = tuple(code for code, _label in _LICENSE_FIELDS if code in found)
+        self._syncing_fields = True
+        try:
+            for code in visible:
+                value = found[code][2]
+                if self.field_vars[code].get() != value:
+                    self.field_vars[code].set(value)
+            if visible != self._shown_fields:
+                self._shown_fields = visible
+                self._layout_license_fields(visible)
+        finally:
+            self._syncing_fields = False
+
+    def _on_field_write(self, code: str) -> None:
+        if self._syncing_fields:
+            return
+        if self._dialog_content is None:
+            return
+        text = self._dialog_content.get("1.0", "end-1c")
+        found = find_license_fields(text)
+        if code not in found:
+            return
+        start, end, current = found[code]
+        updated = self.field_vars[code].get()
+        if updated == current:
+            return
+        self._replace_span(start, end, updated)
+
+    def _replace_span(self, start: int, end: int, value: str) -> None:
+        if self._dialog_content is None:
+            return
+        self._ignore_modified = True
+        self._dialog_content.delete(f"1.0 + {start} chars", f"1.0 + {end} chars")
+        if value:
+            self._dialog_content.insert(f"1.0 + {start} chars", value)
+        self._dialog_content.edit_modified(False)
+        self._ignore_modified = False
+
+    def _note_content_edited(self) -> None:
+        if self.generated_image is not None:
+            self.generated_dirty = True
+            self.status.configure(text="Content changed. Click Generate to update the barcode.")
+        self._refresh_buttons()
 
     def _preview_card(self, parent: ttk.Frame, title: str, key: str, placeholder: str) -> ttk.LabelFrame:
         frame = ttk.LabelFrame(parent, text=title, padding=8)
@@ -839,22 +1102,30 @@ class App(TkinterDnD.Tk):
         view["photo"] = photo
         canvas.create_image(left + src_x0 * scale, top + src_y0 * scale, image=photo, anchor="nw")
 
+    def _write_text(self, widget: tk.Text, value: str) -> None:
+        widget.delete("1.0", "end")
+        if value:
+            widget.insert("1.0", value)
+        widget.edit_modified(False)
+
     def _set_text(self, value: str) -> None:
         self._ignore_modified = True
-        self.content.delete("1.0", "end")
-        if value:
-            self.content.insert("1.0", value)
-        self.content.edit_modified(False)
+        self._write_text(self.content, value)
         self._ignore_modified = False
+        if self._dialog_alive():
+            self._close_fields_dialog()
 
     def _on_modified(self, _event=None) -> None:
         if self._ignore_modified or not self.content.edit_modified():
             return
         self.content.edit_modified(False)
-        if self.generated_image is not None:
-            self.generated_dirty = True
-            self.status.configure(text="Content changed. Click Generate to update the barcode.")
-        self._refresh_buttons()
+        self._note_content_edited()
+
+    def _on_dialog_modified(self, _event=None) -> None:
+        if self._ignore_modified or self._dialog_content is None or not self._dialog_content.edit_modified():
+            return
+        self._dialog_content.edit_modified(False)
+        self._sync_fields_from_content()
 
     def _show_result(self, rows: int | None, columns: int | None, level: int | None) -> None:
         if rows and columns and level is not None:
@@ -949,6 +1220,7 @@ class App(TkinterDnD.Tk):
         state = "disabled" if self._busy else "normal"
         self.upload_button.configure(state=state)
         self.screenshot_button.configure(state=state)
+        self.details_button.configure(state=state)
         for spin in self._layout_spins:
             spin.configure(state=state)
         self.generate_button.configure(state="normal" if can_generate else "disabled")
