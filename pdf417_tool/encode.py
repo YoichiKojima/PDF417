@@ -18,9 +18,12 @@ class GenerateOptions:
     scale: int = 3
     quiet_zone: bool = True
     eci: str | None = "UTF-8"
+    shortened: bool = False
+    encoded: str | bytes | None = None
 
 
 PDF417_MAX_CODEWORDS = 928
+PDF417_MAX_COLUMNS = 30
 
 
 def legal_symbol_size(
@@ -58,19 +61,36 @@ def generate_fitted(
     scale: int = 4,
     eci: str | None = "UTF-8",
 ) -> tuple[Image.Image, GenerateOptions]:
-    """Draw a PDF417 using the scanned layout, relaxing the size only if the data will not fit."""
+    """Draw a PDF417 using the scanned layout, relaxing the size only if the data will not fit.
+
+    A payload past the 928-codeword limit is drawn at the widest symbol and the
+    lowest error correction that can hold it. If even that is too small, the
+    payload is cut to the longest prefix that fits.
+    """
+    level = 2 if ec_level is None else ec_level
+    columns, rows = legal_symbol_size(columns, rows)
     plans: list[GenerateOptions] = []
-    if columns and rows and ec_level is not None:
-        plans.append(GenerateOptions(columns=columns, rows=rows, ec_level=ec_level, scale=scale, eci=eci))
-    if columns and ec_level is not None:
-        plans.append(GenerateOptions(columns=columns, ec_level=ec_level, scale=scale, eci=eci))
-    plans.append(GenerateOptions(ec_level=2 if ec_level is None else ec_level, scale=scale, eci=eci))
+    if columns and rows:
+        plans.append(GenerateOptions(columns=columns, rows=rows, ec_level=level, scale=scale, eci=eci))
+    if columns:
+        plans.append(GenerateOptions(columns=columns, ec_level=level, scale=scale, eci=eci))
+    plans.append(GenerateOptions(ec_level=level, scale=scale, eci=eci))
+    if columns != PDF417_MAX_COLUMNS:
+        plans.append(GenerateOptions(columns=PDF417_MAX_COLUMNS, ec_level=level, scale=scale, eci=eci))
+    for lower in range(level - 1, -1, -1):
+        plans.append(GenerateOptions(columns=PDF417_MAX_COLUMNS, ec_level=lower, scale=scale, eci=eci))
     last_error: Exception | None = None
+    saw_capacity = False
     for options in plans:
         try:
             return generate_image(content, options), options
         except Exception as exc:
             last_error = exc
+            saw_capacity = saw_capacity or _is_capacity_error(exc)
+    if saw_capacity:
+        fitted = _fit_maximum(content, scale=scale, eci=eci)
+        if fitted is not None:
+            return fitted
     raise last_error or RuntimeError("Could not generate a barcode")
 
 
@@ -100,6 +120,55 @@ def generate_to_path(
         image = with_transparent_background(image)
     image.save(destination)
     return destination
+
+
+def _is_capacity_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "too long" in text or "too many codewords" in text
+
+
+def _fit_maximum(
+    content: str | bytes,
+    *,
+    scale: int,
+    eci: str | None,
+) -> tuple[Image.Image, GenerateOptions] | None:
+    """Longest prefix that fits in the largest PDF417, at the lowest error correction."""
+    if not content:
+        return None
+    stored_eci = eci if isinstance(content, str) else None
+    probe = GenerateOptions(columns=PDF417_MAX_COLUMNS, ec_level=0, scale=1, eci=stored_eci)
+
+    def fits(length: int) -> bool:
+        if length <= 0:
+            return False
+        try:
+            generate_image(content[:length], probe)
+        except Exception as exc:
+            if _is_capacity_error(exc):
+                return False
+            raise
+        return True
+
+    if not fits(1):
+        return None
+    low, high = 1, len(content)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits(mid):
+            low = mid
+        else:
+            high = mid - 1
+    encoded = content[:low]
+    options = GenerateOptions(
+        columns=PDF417_MAX_COLUMNS,
+        ec_level=0,
+        scale=scale,
+        eci=stored_eci,
+        shortened=len(encoded) < len(content),
+        encoded=encoded,
+    )
+    return generate_image(encoded, options), options
 
 
 def _creator_kwargs(content: str | bytes, options: GenerateOptions) -> dict:

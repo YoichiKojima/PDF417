@@ -11,7 +11,7 @@ def main() -> None:
     sys.path.insert(0, str(ROOT))
     from pdf417_tool.icon import save_ico
 
-    icon_path = ROOT / "build" / "PDF417.ico"
+    icon_path = ROOT / "assets" / "PDF417.ico"
     icon_path.parent.mkdir(exist_ok=True)
     save_ico(icon_path)
 

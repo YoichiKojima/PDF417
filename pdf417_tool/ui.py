@@ -123,6 +123,7 @@ class App(TkinterDnD.Tk):
         self._enable_file_drop()
         self._start_screenshot_hotkey()
         self._start_tray()
+        self._listen_for_activate()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_buttons()
         self.after(50, self._poll_events)
@@ -632,6 +633,23 @@ class App(TkinterDnD.Tk):
                 self._events.put(("screenshot-hotkey", None))
         user32.UnregisterHotKey(None, 1)
 
+    def _listen_for_activate(self) -> None:
+        if sys.platform != "win32" or len(_instance_handles) < 2:
+            return
+        event = _instance_handles[1]
+
+        def watch() -> None:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            while kernel32.WaitForSingleObject(event, 0xFFFFFFFF) == 0:
+                self._events.put(("tray-show", None))
+
+        threading.Thread(target=watch, daemon=True).start()
+
     def _start_tray(self) -> None:
         try:
             import pystray
@@ -875,7 +893,15 @@ class App(TkinterDnD.Tk):
         if rows and columns:
             self._set_layout_fields(columns, rows, level if level is not None else options.ec_level)
         self._show_result(rows, columns, level)
-        message = "Generated the full payload. Click Save to write the image."
+        if options.shortened and isinstance(options.encoded, str):
+            display = measured.text if measured and measured.text else options.encoded
+            self.original_text = display
+            self.original_bytes = options.encoded.encode("latin-1")
+            self.original_is_binary = False
+            self._set_text(display)
+            message = "Cut the content to the maximum a PDF417 can hold. Click Save to write the image."
+        else:
+            message = "Generated the full payload. Click Save to write the image."
         self._set_busy(False, message, value=100)
         self._refresh_buttons()
 
@@ -1520,8 +1546,66 @@ def _measured_rows(image: Image.Image) -> int | None:
 
 def main() -> None:
     _enable_windows_dpi()
+    if not _claim_single_instance():
+        return
     app = App()
     app.mainloop()
+
+
+_INSTANCE_MUTEX = "Local\\PDF417Barcode"
+_INSTANCE_EVENT = "Local\\PDF417BarcodeShow"
+_instance_handles: list[int] = []
+
+
+def _claim_single_instance() -> bool:
+    """Open one window. A second launch shows the window that is already running."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.restype = wintypes.DWORD
+
+    mutex = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX)
+    if not mutex:
+        return True
+    already_running = kernel32.GetLastError() == 183
+    if already_running:
+        kernel32.CloseHandle(mutex)
+        _signal_running_instance()
+        return False
+    event = kernel32.CreateEventW(None, False, False, _INSTANCE_EVENT)
+    _instance_handles.extend([mutex, event])
+    return True
+
+
+def _signal_running_instance() -> None:
+    import ctypes
+    import time
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+    for _ in range(20):
+        event = kernel32.OpenEventW(0x0002, False, _INSTANCE_EVENT)
+        if event:
+            kernel32.SetEvent(event)
+            kernel32.CloseHandle(event)
+            return
+        time.sleep(0.05)
 
 
 def _enable_windows_dpi() -> None:
