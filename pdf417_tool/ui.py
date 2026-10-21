@@ -15,7 +15,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 
-from .decode import Pdf417Symbol, decode_image
+from .decode import Pdf417Symbol, common_code_text, decode_image, read_upload
 from .encode import GenerateOptions, generate_fitted, legal_symbol_size, with_transparent_background
 from .icon import app_icon
 
@@ -96,6 +96,7 @@ class App(TkinterDnD.Tk):
         self._fields_shown = False
         self._fields_dialog: tk.Toplevel | None = None
         self._dialog_content: tk.Text | None = None
+        self._code_dialog: tk.Toplevel | None = None
         self.field_vars: dict[str, tk.StringVar] = {}
         self._field_widgets: dict[str, tuple[ttk.Label, ttk.Entry]] = {}
         self._shown_fields: tuple[str, ...] = ()
@@ -178,7 +179,7 @@ class App(TkinterDnD.Tk):
             style="Hint.TLabel",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 12))
 
-        self.source_frame = self._preview_card(root, "Uploaded barcode", "source", "Click to upload a barcode")
+        self.source_frame = self._preview_card(root, "Uploaded Image", "source", "Click to upload a barcode")
         self.source_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 6))
         self._build_zoom_controls(root)
         self.generated_frame = self._preview_card(
@@ -741,6 +742,7 @@ class App(TkinterDnD.Tk):
         self._load_image(self.source_image, "the current image", keep_view=True)
 
     def _load_image(self, image: Image.Image, label: str, *, keep_view: bool = False) -> None:
+        self._close_code_dialog()
         self.source_image = image
         self.generated_image = None
         self.generated_dirty = False
@@ -763,6 +765,8 @@ class App(TkinterDnD.Tk):
                 kind, payload = self._events.get_nowait()
                 if kind == "decoded":
                     self._decode_done(payload)
+                elif kind == "common-code":
+                    self._common_code_done(payload)
                 elif kind == "decode-error":
                     self._decode_failed(payload)
                 elif kind == "generated":
@@ -784,9 +788,12 @@ class App(TkinterDnD.Tk):
 
     def _decode_worker(self, image: Image.Image) -> None:
         try:
-            result = decode_image(image)
+            result, common = read_upload(image)
         except Exception as exc:
             self._events.put(("decode-error", exc))
+            return
+        if common and not result.symbols:
+            self._events.put(("common-code", common))
             return
         self._events.put(("decoded", result))
 
@@ -820,6 +827,119 @@ class App(TkinterDnD.Tk):
             )
         )
         self._refresh_buttons()
+
+    def _common_code_done(self, symbols: list[Pdf417Symbol]) -> None:
+        self._set_busy(False, "", value=100)
+        if self.source_image is None:
+            self.status.configure(text="Uploaded image cleared.")
+            self._refresh_buttons()
+            return
+        if len(symbols) == 1:
+            self.status.configure(text=f"{symbols[0].format} read. Copy the content from the dialog.")
+        else:
+            self.status.configure(text=f"Found {len(symbols)} barcodes. Copy the content from the dialog.")
+        self._show_code_dialog(symbols)
+        self._refresh_buttons()
+
+    def _show_code_dialog(self, symbols: list[Pdf417Symbol]) -> None:
+        self._close_code_dialog()
+        dialog = tk.Toplevel(self)
+        self._code_dialog = dialog
+        single = len(symbols) == 1
+        dialog.title(symbols[0].format if single else "Barcodes")
+        dialog.configure(bg="#f3f4f6")
+        dialog.transient(self)
+        dialog.iconphoto(False, self._window_icon)
+        dialog.minsize(480, 120)
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        first_field: ttk.Entry | None = None
+
+        for index, symbol in enumerate(symbols):
+            block = ttk.Frame(body)
+            block.grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 12, 0))
+            block.columnconfigure(0, weight=1)
+            row = 0
+            if not single:
+                ttk.Label(block, text=symbol.format, font=("Segoe UI", 10, "bold")).grid(
+                    row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+                )
+                row = 1
+            field = self._code_value(block, row, common_code_text(symbol))
+            if first_field is None:
+                first_field = field
+
+        actions = ttk.Frame(body)
+        actions.grid(row=len(symbols), column=0, sticky="e", pady=(12, 0))
+        ttk.Button(actions, text="Close", style="Action.TButton", command=self._close_code_dialog).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", self._close_code_dialog)
+        dialog.bind("<Escape>", lambda _event: self._close_code_dialog())
+        dialog.update_idletasks()
+        width = max(dialog.winfo_reqwidth(), 520)
+        height = max(dialog.winfo_reqheight(), 120)
+        left = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        top = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{left}+{top}")
+        dialog.grab_set()
+        dialog.focus_force()
+        if first_field is not None:
+            first_field.focus_set()
+            first_field.selection_range(0, "end")
+
+    def _code_value(self, parent: ttk.Frame, row: int, text: str) -> ttk.Entry | None:
+        line = ttk.Frame(parent)
+        line.grid(row=row, column=0, columnspan=2, sticky="ew")
+        line.columnconfigure(0, weight=1)
+        button = ttk.Button(line, text="Copy", style="Action.TButton")
+        button.configure(command=lambda value=text, widget=button: self._copy_code(value, widget))
+        button.grid(row=0, column=1, padx=(8, 0), sticky="ne")
+        if "\n" in text:
+            box = tk.Text(
+                line,
+                height=min(8, text.count("\n") + 1),
+                width=48,
+                wrap="word",
+                font=("Consolas", 11),
+                relief="solid",
+                bd=1,
+                padx=8,
+                pady=6,
+            )
+            box.insert("1.0", text)
+            box.configure(state="disabled")
+            box.grid(row=0, column=0, sticky="ew")
+            return None
+        entry = ttk.Entry(line, width=48, font=("Consolas", 11))
+        entry.insert(0, text)
+        entry.configure(state="readonly")
+        entry.grid(row=0, column=0, sticky="ew")
+        return entry
+
+    def _copy_code(self, text: str, button: ttk.Button) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+        button.configure(text="Copied")
+
+        def restore() -> None:
+            if button.winfo_exists():
+                button.configure(text="Copy")
+
+        self.after(1200, restore)
+
+    def _close_code_dialog(self) -> None:
+        dialog = self._code_dialog
+        self._code_dialog = None
+        if dialog is None or not dialog.winfo_exists():
+            return
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
 
     def _decode_failed(self, exc: Exception) -> None:
         self._set_busy(False, "Could not read that image.", value=0)

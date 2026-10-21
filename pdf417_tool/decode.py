@@ -75,6 +75,134 @@ def decode_path(path: str | Path, *, pdf417_only: bool = True) -> DecodeResult:
     return result
 
 
+def read_upload(image: Image.Image) -> tuple[DecodeResult, list[Pdf417Symbol]]:
+    """Read a PDF417 symbol, or a QR code / ordinary barcode when that is what was uploaded.
+
+    A QR code or linear barcode on the original image is returned immediately.
+    PDF417 still wins when the first pass can read it, including tilted photos
+    that need the longer search.
+    """
+
+    rgb = image.convert("RGB")
+    try:
+        pdf417_ready = bool(_read(rgb, pdf417_only=True))
+    except Exception:
+        pdf417_ready = False
+    if pdf417_ready:
+        return decode_image(image), []
+    common = read_common_codes(rgb)
+    if common:
+        return DecodeResult(image_size=rgb.size), common
+    result = decode_image(image)
+    if result.symbols:
+        return result, []
+    return result, read_common_codes(image, thorough=True)
+
+
+def common_code_name(fmt: str) -> str:
+    """Short label for a QR code or linear barcode format."""
+
+    names = {
+        "QRCode": "QR Code",
+        "MicroQRCode": "Micro QR Code",
+        "RMQRCode": "rMQR Code",
+        "Code128": "Code 128",
+        "Code39": "Code 39",
+        "Code39Ext": "Code 39",
+        "Code39Std": "Code 39",
+        "Code93": "Code 93",
+        "Code32": "Code 32",
+        "Codabar": "Codabar",
+        "EAN13": "EAN-13",
+        "EAN8": "EAN-8",
+        "EAN2": "EAN-2",
+        "EAN5": "EAN-5",
+        "UPCA": "UPC-A",
+        "UPCE": "UPC-E",
+        "ITF": "ITF",
+        "ITF14": "ITF-14",
+        "ISBN": "ISBN",
+        "PZN": "PZN",
+        "Telepen": "Telepen",
+        "TelepenAlpha": "Telepen",
+        "TelepenNumeric": "Telepen",
+        "DataBar": "GS1 DataBar",
+        "DataBarOmni": "GS1 DataBar",
+        "DataBarLtd": "GS1 DataBar Limited",
+        "DataBarExp": "GS1 DataBar Expanded",
+        "DataBarStk": "GS1 DataBar Stacked",
+        "DataBarStkOmni": "GS1 DataBar Stacked",
+        "DataBarExpStk": "GS1 DataBar Expanded Stacked",
+    }
+    return names.get(fmt, fmt)
+
+
+def common_code_text(symbol: Pdf417Symbol) -> str:
+    """Text to show and copy for a non-PDF417 symbol."""
+
+    if symbol.text:
+        return symbol.text
+    if not symbol.raw_bytes:
+        return ""
+    try:
+        return symbol.raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return symbol.raw_bytes.hex()
+
+
+_COMMON_FORMATS = (
+    zxingcpp.BarcodeFormat.QRCode,
+    zxingcpp.BarcodeFormat.MicroQRCode,
+    zxingcpp.BarcodeFormat.RMQRCode,
+    zxingcpp.BarcodeFormat.AllLinear,
+)
+
+
+def read_common_codes(image: Image.Image, *, thorough: bool = False) -> list[Pdf417Symbol]:
+    """Read QR and ordinary linear barcodes, without the tilted-PDF417 search."""
+
+    rgb = image.convert("RGB")
+    if thorough:
+        gray = ImageOps.grayscale(rgb)
+        stretched = ImageOps.autocontrast(gray)
+        candidates = [gray, stretched, ImageOps.invert(stretched)]
+    else:
+        candidates = [rgb]
+        if max(rgb.size) < _SMALL_SIDE:
+            gray = ImageOps.grayscale(rgb)
+            for factor in (2, 3):
+                if max(gray.size) * factor > _UPSCALE_MAX_SIDE:
+                    break
+                candidates.append(
+                    gray.resize((gray.width * factor, gray.height * factor), Image.Resampling.LANCZOS)
+                )
+    return _first_common(candidates)
+
+
+def _first_common(candidates: list[Image.Image]) -> list[Pdf417Symbol]:
+    seen: set[tuple[str, bytes, str]] = set()
+    for candidate in candidates:
+        try:
+            symbols = _read(candidate, pdf417_only=False, formats=_COMMON_FORMATS)
+        except Exception:
+            continue
+        found: list[Pdf417Symbol] = []
+        for symbol in symbols:
+            if "PDF417" in symbol.format.upper() or not symbol.valid:
+                continue
+            if not symbol.text and not symbol.raw_bytes:
+                continue
+            key = (symbol.format, symbol.raw_bytes, symbol.text)
+            if key in seen:
+                continue
+            seen.add(key)
+            symbol.format = common_code_name(symbol.format)
+            found.append(symbol)
+        if found:
+            return found
+    return []
+
+
 def decode_image(image: Image.Image, *, pdf417_only: bool = True) -> DecodeResult:
     """Decode PDF417 symbols, trying a few image variants when the first pass misses."""
     last_error: Exception | None = None
@@ -407,12 +535,14 @@ def _read(
     pdf417_only: bool,
     thorough: bool = True,
     binarizer=zxingcpp.Binarizer.LocalAverage,
+    formats=None,
 ) -> list[Pdf417Symbol]:
-    formats = (
-        zxingcpp.BarcodeFormat.PDF417 | zxingcpp.BarcodeFormat.CompactPDF417 | zxingcpp.BarcodeFormat.MicroPDF417
-        if pdf417_only
-        else zxingcpp.BarcodeFormats()
-    )
+    if formats is None:
+        formats = (
+            zxingcpp.BarcodeFormat.PDF417 | zxingcpp.BarcodeFormat.CompactPDF417 | zxingcpp.BarcodeFormat.MicroPDF417
+            if pdf417_only
+            else zxingcpp.BarcodeFormats()
+        )
     found = zxingcpp.read_barcodes(
         image,
         formats=formats,
