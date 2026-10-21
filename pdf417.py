@@ -4,7 +4,11 @@ import sys
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
+    from pdf417_tool.startup import TRAY_ARGUMENT
+
+    # The sign-in entry passes --tray so the window stays closed. Any other
+    # argument is still a command-line request.
+    if len(sys.argv) > 1 and sys.argv[1:] != [TRAY_ARGUMENT]:
         from pdf417_tool.cli import main as cli_main
 
         raise SystemExit(cli_main())

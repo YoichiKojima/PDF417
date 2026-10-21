@@ -18,6 +18,7 @@ from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 from .decode import Pdf417Symbol, common_code_text, decode_image, read_upload
 from .encode import GenerateOptions, generate_fitted, legal_symbol_size, with_transparent_background
 from .icon import app_icon
+from . import startup
 
 PREVIEW_WIDTH = 460
 PREVIEW_HEIGHT = 250
@@ -78,8 +79,11 @@ def find_license_fields(text: str) -> dict[str, tuple[int, int, str]]:
 
 
 class App(TkinterDnD.Tk):
-    def __init__(self) -> None:
+    def __init__(self, *, start_in_tray: bool = False) -> None:
         super().__init__()
+        # Withdraw before the window is mapped so a sign-in launch does not flash the UI.
+        if start_in_tray:
+            self.withdraw()
         self.title("PDF417 Barcode")
         self.geometry("1020x760")
         self.minsize(880, 680)
@@ -115,7 +119,7 @@ class App(TkinterDnD.Tk):
         self._space_down = False
         self._snipping = False
         self._tray = None
-        self._in_tray = False
+        self._in_tray = start_in_tray
 
         self._window_icon = ImageTk.PhotoImage(app_icon(64))
         self.iconphoto(True, self._window_icon)
@@ -124,6 +128,9 @@ class App(TkinterDnD.Tk):
         self._enable_file_drop()
         self._start_screenshot_hotkey()
         self._start_tray()
+        if start_in_tray and self._tray is None:
+            self._in_tray = False
+            self.deiconify()
         self._listen_for_activate()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_buttons()
@@ -660,18 +667,45 @@ class App(TkinterDnD.Tk):
         def send(kind: str):
             return lambda _icon, _item: self._events.put((kind, None))
 
-        menu = pystray.Menu(
+        items: list = [
             pystray.MenuItem("Screenshot\tAlt+S", send("screenshot-hotkey")),
             pystray.MenuItem("Show window", send("tray-show"), default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit", send("tray-exit")),
+        ]
+        if startup.supported():
+            items.append(
+                pystray.MenuItem(
+                    "Start with Windows",
+                    self._toggle_startup,
+                    checked=lambda _item: startup.enabled(),
+                )
+            )
+        items.extend(
+            (
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Exit", send("tray-exit")),
+            )
         )
+        menu = pystray.Menu(*items)
         try:
             self._tray = pystray.Icon("PDF417", app_icon(64), "PDF417 Barcode", menu)
             # Callbacks arrive on the tray thread and only queue events for Tk.
             threading.Thread(target=self._tray.run, daemon=True).start()
         except Exception:
             self._tray = None
+
+    def _toggle_startup(self, icon, _item) -> None:
+        try:
+            startup.set_enabled(not startup.enabled())
+        except OSError as exc:
+            self._events.put(("startup-error", str(exc)))
+            return
+        update = getattr(icon, "update_menu", None)
+        if not callable(update):
+            return
+        try:
+            update()
+        except Exception:
+            pass
 
     def _on_close(self) -> None:
         if self._tray is None:
@@ -718,6 +752,15 @@ class App(TkinterDnD.Tk):
             return
         self._restore_window()
         self._load_image(image, "screenshot")
+
+    def _report_startup_error(self, message: str) -> None:
+        text = f"Could not change Start with Windows.\n\n{message}"
+        if self._in_tray and sys.platform == "win32":
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, text, "PDF417 Barcode", 0x10)
+            return
+        messagebox.showerror("Start with Windows", text)
 
     def _restore_window(self) -> None:
         self._in_tray = False
@@ -780,6 +823,8 @@ class App(TkinterDnD.Tk):
                 elif kind == "tray-exit":
                     self._quit()
                     return
+                elif kind == "startup-error":
+                    self._report_startup_error(str(payload))
                 elif kind == "hotkey-unavailable":
                     self.status.configure(text="Alt+S is taken by another app, so the screenshot hotkey is off.")
         except queue.Empty:
@@ -1666,9 +1711,11 @@ def _measured_rows(image: Image.Image) -> int | None:
 
 def main() -> None:
     _enable_windows_dpi()
-    if not _claim_single_instance():
+    start_in_tray = startup.hidden_on_launch()
+    if not _claim_single_instance(show_existing=not start_in_tray):
         return
-    app = App()
+    startup.use_existing_hidden_launch()
+    app = App(start_in_tray=start_in_tray)
     app.mainloop()
 
 
@@ -1677,7 +1724,7 @@ _INSTANCE_EVENT = "Local\\PDF417BarcodeShow"
 _instance_handles: list[int] = []
 
 
-def _claim_single_instance() -> bool:
+def _claim_single_instance(*, show_existing: bool = True) -> bool:
     """Open one window. A second launch shows the window that is already running."""
     if sys.platform != "win32":
         return True
@@ -1699,7 +1746,8 @@ def _claim_single_instance() -> bool:
     already_running = kernel32.GetLastError() == 183
     if already_running:
         kernel32.CloseHandle(mutex)
-        _signal_running_instance()
+        if show_existing:
+            _signal_running_instance()
         return False
     event = kernel32.CreateEventW(None, False, False, _INSTANCE_EVENT)
     _instance_handles.extend([mutex, event])
